@@ -71,9 +71,16 @@ def scale_ln_fcs(ln: nn.Linear, fcs: List[nn.Linear], scales: torch.Tensor):
     if not isinstance(fcs, list):
         fcs = [fcs]
     
-    scales = scales.to(ln.weight.device)
+    if hasattr(ln, "weight"):
+        weight = ln.weight
+    elif hasattr(ln, "scale"):
+        weight = ln.scale
+    else:
+        raise Exception("Normalization layer is of unknown type.")
+    
+    scales = scales.to(weight.device)
 
-    ln.weight.div_(scales)
+    weight.div_(scales)
     if hasattr(ln, 'bias') and ln.bias is not None:
         ln.bias.div_(scales)
 
