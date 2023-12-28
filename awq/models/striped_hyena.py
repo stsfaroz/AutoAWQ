@@ -6,6 +6,11 @@ class StripedHyenaAWQForCausalLM(BaseAWQForCausalLM):
 
     @staticmethod
     def get_model_layers(model):
+        try:
+            import flash_attn
+        except ImportError:
+            raise ImportError("Flash Attention is required for Striped Hyena: pip install flash-attn")
+        
         return model.backbone.blocks
     
     @staticmethod
