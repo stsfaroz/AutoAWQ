@@ -29,9 +29,10 @@ class StripedHyenaAWQForCausalLM(BaseAWQForCausalLM):
         layers = []
 
         if module.__class__.__name__ == "ParallelGatedConvBlock":
+            # NOTE: out_filter_dense has prev_op of conv1d
             layers.append(dict(
                 prev_op=module.pre_norm,
-                layers=[module.projections, module.out_filter_dense],
+                layers=[module.projections],
                 inp=input_feat['projections'],
                 module2inspect=module.projections,
                 kwargs=module_kwargs,

@@ -67,20 +67,22 @@ def apply_scale(module, scales_list, input_feat_dict=None):
         scales.cpu()
 
 @torch.no_grad()
-def scale_ln_fcs(ln: nn.Linear, fcs: List[nn.Linear], scales: torch.Tensor):
+def scale_ln_fcs(ln: nn.LayerNorm, fcs: List[nn.Linear], scales: torch.Tensor):
     if not isinstance(fcs, list):
         fcs = [fcs]
     
-    if hasattr(ln, "weight"):
-        weight = ln.weight
-    elif hasattr(ln, "scale"):
-        weight = ln.scale
+    ln_names = ["weight", "scale"]
+
+    for name in ln_names:
+        if hasattr(ln, name):
+            device = ln.get_parameter(name).device
+            break
     else:
         raise Exception("Normalization layer is of unknown type.")
     
-    scales = scales.to(weight.device)
+    scales = scales.to(device)
 
-    weight.div_(scales)
+    ln.get_parameter(name).div_(scales)
     if hasattr(ln, 'bias') and ln.bias is not None:
         ln.bias.div_(scales)
 
