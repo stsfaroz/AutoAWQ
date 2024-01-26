@@ -2,6 +2,7 @@ import os
 import gc
 import json
 import torch
+import functools
 import transformers
 import torch.nn as nn
 
@@ -12,7 +13,7 @@ from huggingface_hub import snapshot_download
 from transformers.modeling_utils import shard_checkpoint
 
 from awq.modules.linear.gemm import WQLinear_GEMM
-from awq.modules.linear.gemv import WQLinear_GEMV
+from awq.modules.linear.gemv import WQLinear_GEMV, gemv_post_init
 from awq.modules.linear.exllama import WQLinear_Exllama, exllama_post_init
 from awq.modules.linear.exllamav2 import WQLinear_ExllamaV2, exllamav2_post_init
 from awq.utils.module import (
@@ -247,6 +248,7 @@ class BaseAWQForCausalLM(nn.Module):
         fuse_layers=False,
         use_exllama=False,
         use_exllama_v2=False,
+        use_gemv=False,
         version="GEMM",
         device_map="balanced",
         offload_folder=None,
@@ -283,6 +285,7 @@ class BaseAWQForCausalLM(nn.Module):
             quant_config.version,
             use_exllama=use_exllama,
             use_exllama_v2=use_exllama_v2,
+            use_gemv=use_gemv,
         )
 
         model.tie_weights()
@@ -313,6 +316,8 @@ class BaseAWQForCausalLM(nn.Module):
                 max_input_len=max_new_tokens,
                 max_batch_size=int(os.getenv("AWQ_BATCH_SIZE", 1))
             )
+        elif use_gemv:
+            model = gemv_post_init(model)
 
         return self(
             model,
@@ -373,7 +378,7 @@ class BaseAWQForCausalLM(nn.Module):
         return model_weights_path, config, quant_config
 
     def _load_quantized_modules(
-        self, model, quant_config, version, use_exllama, use_exllama_v2
+        self, model, quant_config, version, use_exllama, use_exllama_v2, use_gemv
     ):
         # Real quantization of weights
         assert quant_config.zero_point, "We only support zero_point quantization now."
@@ -401,15 +406,17 @@ class BaseAWQForCausalLM(nn.Module):
             # Replace nn.Linear with WQLinear
             for name, module in named_linears.items():
                 if use_exllama:
-                    q_linear_module = WQLinear_Exllama
+                    q_linear_module = WQLinear_Exllama.from_linear
                 elif use_exllama_v2:
-                    q_linear_module = WQLinear_ExllamaV2
+                    q_linear_module = WQLinear_ExllamaV2.from_linear
+                elif use_gemv:
+                    q_linear_module = functools.partial(WQLinear_GEMV.from_linear, from_gemm=True)
                 elif version == "GEMM":
-                    q_linear_module = WQLinear_GEMM
+                    q_linear_module = WQLinear_GEMM.from_linear
                 elif version == "GEMV":
-                    q_linear_module = WQLinear_GEMV
+                    q_linear_module = WQLinear_GEMV.from_linear
 
-                q_linear = q_linear_module.from_linear(
+                q_linear = q_linear_module(
                     module, quant_config.w_bit, quant_config.q_group_size, True
                 )
                 q_linear.to(next(layer.parameters()).device)

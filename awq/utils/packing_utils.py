@@ -5,17 +5,17 @@ AWQ_ORDER = [0, 2, 4, 6, 1, 3, 5, 7]
 AWQ_REVERSE_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
 
 
-def unpack_awq(qweight: torch.Tensor, qzeros: torch.Tensor, bits: int):
+def unpack_awq(qweight: torch.Tensor, qzeros: torch.Tensor, bits: int, shifter=torch.bitwise_right_shift):
     shifts = torch.arange(0, 32, bits, device=qzeros.device)
 
     # unpacking columnwise
-    iweights = torch.bitwise_right_shift(qweight[:, :, None], shifts[None, None, :]).to(
+    iweights = shifter(qweight[:, :, None], shifts[None, None, :]).to(
         torch.int8  # smallest dtype available
     )
     iweights = iweights.view(iweights.shape[0], -1)
 
     # unpacking columnwise
-    izeros = torch.bitwise_right_shift(qzeros[:, :, None], shifts[None, None, :]).to(
+    izeros = shifter(qzeros[:, :, None], shifts[None, None, :]).to(
         torch.int8  # smallest dtype available
     )
     izeros = izeros.view(izeros.shape[0], -1)
@@ -79,7 +79,7 @@ def unpack_reorder_pack(qweight, qzeros, bits):
 
     return qweight, qzeros
 
-def dequantize_gemm(qweight, qzeros, scales, bits, group_size):
+def dequantize_gemm(qweight, qzeros, scales, bits, group_size, return_zeros=False):
     # Unpack the qweight and qzeros tensors
     iweight, izeros = unpack_awq(qweight, qzeros, bits)
     # Reverse the order of the iweight and izeros tensors
@@ -94,4 +94,25 @@ def dequantize_gemm(qweight, qzeros, scales, bits, group_size):
     izeros = izeros.repeat_interleave(group_size, dim=0)
     iweight = (iweight - izeros) * scales
 
-    return iweight
+    if return_zeros:
+        return iweight, izeros
+    else:
+        return iweight
+
+def dequantize_gemv(qweight, qzeros, scales, bits, group_size, return_zeros=False):
+    # Unpack the qweight and qzeros tensors
+    iweight, izeros = unpack_awq(qweight, qzeros, bits, shifter=torch.bitwise_left_shift)
+
+    # overflow checks
+    iweight = torch.bitwise_and(iweight, (2**bits) - 1)
+    izeros = torch.bitwise_and(izeros, (2**bits) - 1)
+
+    # fp16 weights
+    scales = scales.repeat_interleave(group_size, dim=0)
+    izeros = izeros.repeat_interleave(group_size, dim=0)
+    iweight = (iweight - izeros) * scales
+
+    if return_zeros:
+        return iweight, izeros
+    else:
+        return iweight

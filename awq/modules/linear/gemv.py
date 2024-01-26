@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from awq.utils.packing_utils import dequantize_gemm, dequantize_gemv
 
 try:
     import awq_ext  # with CUDA kernels
@@ -28,7 +29,7 @@ def calculate_zeros_width(in_features, group_size=128, pack_num=8):
 
 
 class WQLinear_GEMV(nn.Module):
-    def __init__(self, w_bit, group_size, in_features, out_features, bias, dev):
+    def __init__(self, w_bit, group_size, in_features, out_features, bias, dev, from_gemm=True):
         super().__init__()
 
         if w_bit not in [4]:
@@ -39,47 +40,86 @@ class WQLinear_GEMV(nn.Module):
         self.w_bit = w_bit
         self.group_size = group_size if group_size != -1 else in_features
         self.split_k_iters = 8
+        self.from_gemm = from_gemm
 
         # quick sanity check (make sure aligment)
         assert self.in_features % self.group_size == 0
         assert out_features % (32 // self.w_bit) == 0
-        pack_num = 32 // self.w_bit
+        self.pack_num = 32 // self.w_bit
 
-        self.register_buffer(
-            "qweight",
-            torch.zeros(
-                (out_features, in_features // pack_num), dtype=torch.int32, device=dev
-            ),
-        )
-        self.register_buffer(
-            "qzeros",
-            torch.zeros(
-                (out_features, calculate_zeros_width(in_features, self.group_size)),
-                dtype=torch.int32,
-                device=dev,
-            ),
-        )
-        self.register_buffer(
-            "scales",
-            torch.zeros(
-                (
-                    out_features,
-                    calculate_zeros_width(in_features, self.group_size) * pack_num,
+        if from_gemm:
+            self.register_buffer(
+                "qweight",
+                torch.zeros(
+                    (in_features, out_features // (32 // self.w_bit)),
+                    dtype=torch.int32,
+                    device=dev,
                 ),
-                dtype=torch.float16,
-                device=dev,
-            ),
-        )
+            )
+            self.register_buffer(
+                "qzeros",
+                torch.zeros(
+                    (in_features // self.group_size, out_features // (32 // self.w_bit)),
+                    dtype=torch.int32,
+                    device=dev,
+                ),
+            )
+            self.register_buffer(
+                "scales",
+                torch.zeros(
+                    (in_features // self.group_size, out_features),
+                    dtype=torch.float16,
+                    device=dev,
+                ),
+            )
+        else:
+            self.register_buffer(
+                "qweight",
+                torch.zeros(
+                    (out_features, in_features // self.pack_num), dtype=torch.int32, device=dev
+                ),
+            )
+            self.register_buffer(
+                "qzeros",
+                torch.zeros(
+                    (out_features, calculate_zeros_width(in_features, self.group_size)),
+                    dtype=torch.int32,
+                    device=dev,
+                ),
+            )
+            self.register_buffer(
+                "scales",
+                torch.zeros(
+                    (
+                        out_features,
+                        calculate_zeros_width(in_features, self.group_size) * self.pack_num,
+                    ),
+                    dtype=torch.float16,
+                    device=dev,
+                ),
+            )
         if bias:
             self.register_buffer(
                 "bias", torch.zeros((out_features), dtype=torch.float16, device=dev)
             )
         else:
             self.bias = None
+    
+    def post_init(self):
+        if self.from_gemm:
+            self.qweight, self.qzeros = dequantize_gemm(
+                self.qweight,
+                self.qzeros,
+                self.scales.clone(), # scales are modified
+                self.w_bit,
+                self.group_size,
+                return_zeros=True,
+            )
+            self.scales = self.scales.transpose(0,1)
 
     @classmethod
     def from_linear(
-        cls, linear, w_bit, group_size, init_only=False, scales=None, zeros=None
+        cls, linear, w_bit, group_size, init_only=False, scales=None, zeros=None, from_gemm=False,
     ):
         awq_linear = cls(
             w_bit,
@@ -88,6 +128,7 @@ class WQLinear_GEMV(nn.Module):
             linear.out_features,
             linear.bias is not None,
             linear.weight.device,
+            from_gemm=from_gemm,
         )
         if init_only:  # just prepare for loading sd
             return awq_linear
@@ -165,19 +206,29 @@ class WQLinear_GEMV(nn.Module):
         if input_dtype != torch.float16:
             inputs = inputs.half()
 
-        if inputs.shape[0] > 8:
-            out = awq_ext.gemmv2_forward_cuda(
-                inputs,
-                self.qweight,
-                self.scales,
-                self.qzeros,
-                self.group_size,
-                self.split_k_iters,
-            )
+        if AWQ_INSTALLED:
+            if inputs.shape[0] > 8:
+                out = awq_ext.gemmv2_forward_cuda(
+                    inputs,
+                    self.qweight,
+                    self.scales,
+                    self.qzeros,
+                    self.group_size,
+                    self.split_k_iters,
+                )
+            else:
+                out = awq_ext.gemv_forward_cuda(
+                    inputs, self.qweight, self.scales, self.qzeros, self.group_size
+                )
         else:
-            out = awq_ext.gemv_forward_cuda(
-                inputs, self.qweight, self.scales, self.qzeros, self.group_size
+            out = dequantize_gemv(
+                self.qweight,
+                self.qzeros,
+                self.scales,
+                self.w_bit,
+                self.group_size,
             )
+            out = torch.matmul(inputs, out)
 
         if input_dtype != torch.float16:
             out = out.to(dtype=input_dtype)
@@ -195,3 +246,10 @@ class WQLinear_GEMV(nn.Module):
                 self.group_size,
             )
         )
+
+def gemv_post_init(model):
+    for _, submodule in model.named_modules():
+        if isinstance(submodule, WQLinear_GEMV):
+            submodule.post_init()
+
+    return model
