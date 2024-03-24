@@ -457,7 +457,7 @@ class AwqQuantizer:
         class Catcher(nn.Module):
             def __init__(self, module):
                 super().__init__()
-                self.module = module
+                self._module = module
 
             def forward(self, *args, **kwargs):
                 # assume first input to forward is hidden states
@@ -472,13 +472,25 @@ class AwqQuantizer:
                 layer_kwargs.update(kwargs)
                 raise ValueError  # early exit to break later inference
 
+            def __getattr__(self, name):
+                if name == '_module':
+                    return super().__getattr__(name)
+                else:
+                    return getattr(self._module, name)
+
+            def __setattr__(self, name, value):
+                if name == '_module':
+                    super().__setattr__(name, value)
+                else:
+                    setattr(self._module, name, value)
+
         # patch layer 0 to catch input and kwargs
         modules[0] = Catcher(modules[0])
         try:
             self.model(samples.to(next(self.model.parameters()).device))
         except ValueError:  # work with early exit
             pass
-        modules[0] = modules[0].module  # restore
+        modules[0] = modules[0]._module  # restore
 
         # Update the layer kwargs with `prepare_inputs_for_generation` method
         # that takes care of everything to avoid unexpected errors.
