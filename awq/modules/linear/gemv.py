@@ -1,12 +1,14 @@
 import torch
 import torch.nn as nn
+import warnings
 
 try:
     import awq_ext  # with CUDA kernels
-
     AWQ_INSTALLED = True
-except:
+except Exception as e:
     AWQ_INSTALLED = False
+    warnings.warn(f"AWQ extension could not be imported. Error: {e}")
+
 
 
 def make_divisible(c, divisor):
